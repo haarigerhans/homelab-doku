@@ -14,7 +14,7 @@ async function status() {
   await Promise.all((d.nodes || []).map(async n => {
     const h = (n.ip || '').trim(); let up = false, known = false;
     if (okHost(h)) { known = true; up = await ping(h); }
-    if (!up && n.url) { try { const u = new URL(n.url); if (okHost(u.hostname)) { known = true; up = await tcp(u.hostname, +u.port || (u.protocol === 'https:' ? 443 : 80)); } } catch (e) {} }
+    if (!up && n.url) { try { const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(n.url) ? n.url : 'http://' + n.url); if (okHost(u.hostname)) { known = true; up = await tcp(u.hostname, +u.port || (u.protocol === 'https:' ? 443 : 80)); } } catch (e) {} }
     if (known) out[n.id] = up;
   }));
   cache = { t: Date.now(), v: out }; return out;
