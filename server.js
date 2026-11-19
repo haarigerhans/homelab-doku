@@ -21,6 +21,14 @@ async function status() {
 }
 http.createServer((q, r) => {
   if (q.url === '/api/status') { status().then(x => { r.setHeader('content-type', 'application/json'); r.end(JSON.stringify(x)); }); return; }
+  const st = ['/icon.svg', '/icon-192.png', '/icon-512.png', '/manifest.webmanifest'];
+  if (st.includes(q.url)) {
+    const f = path.join(__dirname, q.url.slice(1));
+    if (fs.existsSync(f)) {
+      r.setHeader('content-type', { '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json' }[path.extname(f)]);
+      r.setHeader('cache-control', 'public, max-age=86400'); r.end(fs.readFileSync(f)); return;
+    }
+  }
   if (q.url === '/api/data') {
     if (q.method === 'PUT') {
       let b = ''; q.on('data', c => { b += c; if (b.length > 5e6) q.destroy(); });
