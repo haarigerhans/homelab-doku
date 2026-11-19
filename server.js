@@ -50,35 +50,45 @@ function call(base, p, headers, insecure) {
 }
 const kv = s => Object.fromEntries(String(s || '').split(',').map(x => { const i = x.indexOf('='); return i < 0 ? [x, ''] : [x.slice(0, i), x.slice(i + 1)]; }));
 const MAC = /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i, IPV4 = /^\d+\.\d+\.\d+\.\d+/;
+const maskLen = m => String(m || '').split('.').reduce((a, x) => a + (+x).toString(2).replace(/0/g, '').length, 0);
 async function pve() {
   const c = cfg().pve;
   if (!c || !c.url || !c.tokenId || !c.secret) throw new Error('Proxmox ist nicht vollständig konfiguriert.');
-  const H = { Authorization: `PVEAPIToken=${c.tokenId}=${c.secret}` }, g = p => call(c.url + '/api2/json', p, H, c.insecure).then(r => r.data);
+  const H = { Authorization: `PVEAPIToken=${c.tokenId}=${c.secret}` }, g = p => call(c.url + '/api2/json', p, H, c.insecure).then(r => r.data), warnings = [];
+  const soft = what => e => { warnings.push(`${what}: ${e.message}${/40[13]/.test(e.message) ? ' (Berechtigung fehlt)' : ''}`); return null; };
   const res = await g('/cluster/resources'), st = await g('/cluster/status').catch(() => []);
-  const cluster = (st.find(x => x.type === 'cluster') || {}).name || null;
-  const hosts = await Promise.all(res.filter(x => x.type === 'node').map(async n => {
-    const net = await g(`/nodes/${n.node}/network`).catch(() => []);
-    return { k: 'pve:' + n.node, name: n.node, ifs: net.filter(i => ['eth', 'bridge', 'bond', 'vlan'].includes(i.type)).map(i => ({
+  const stats = {}; res.forEach(x => { stats[x.type] = (stats[x.type] || 0) + 1; });
+  let nodes = res.filter(x => x.type === 'node').map(x => x.node);
+  if (!nodes.length) nodes = ((await g('/nodes').catch(soft('Nodes'))) || []).map(x => x.node);
+  const vms = res.filter(x => x.type === 'qemu' || x.type === 'lxc');
+  if (!vms.length) for (const n of nodes) for (const t of ['qemu', 'lxc']) ((await g(`/nodes/${n}/${t}`).catch(soft(`${n}: ${t}-Liste`))) || []).forEach(x => vms.push({ ...x, type: t, node: n }));
+  const pool = async (arr, fn, n = 6) => { const out = []; let i = 0; await Promise.all(Array.from({ length: n }, async () => { while (i < arr.length) { const k = i++; out[k] = await fn(arr[k]); } })); return out; };
+  const hosts = await pool(nodes, async n => {
+    const net = (await g(`/nodes/${n}/network`).catch(soft(`${n}: Netzwerk`))) || [];
+    return { k: 'pve:' + n, name: n, ifs: net.filter(i => i.iface && i.type !== 'loopback').map(i => ({
       name: i.iface, mode: i.type === 'bridge' && +i.bridge_vlan_aware ? 'trunk' : 'access',
       u: i.type === 'vlan' ? String(i['vlan-id'] || (i.iface.split('.')[1] || '')) : '', t: [],
-      ip: i.cidr || i.address || '', main: !!i.gateway,
-      up: i.type === 'bridge' ? (i.bridge_ports || '').split(/\s+/)[0] : i.type === 'bond' ? (i.slaves || '').split(/\s+/)[0] : i.type === 'vlan' ? (i['vlan-raw-device'] || '') : '' })) };
-  }));
-  const guests = await Promise.all(res.filter(x => x.type === 'qemu' || x.type === 'lxc').map(async vm => {
-    const cf = await g(`/nodes/${vm.node}/${vm.type}/${vm.vmid}/config`).catch(() => ({})), agent = {};
-    if (vm.type === 'qemu' && vm.status === 'running' && /^(1|enabled=1)/.test(String(cf.agent || ''))) {
-      const a = await g(`/nodes/${vm.node}/qemu/${vm.vmid}/agent/network-get-interfaces`).catch(() => null);
-      ((a && a.result) || []).forEach(i => { const ip = (i['ip-addresses'] || []).find(x => x['ip-address-type'] === 'ipv4' && !x['ip-address'].startsWith('127.')); if (ip && i['hardware-address']) agent[i['hardware-address'].toLowerCase()] = ip['ip-address'] + '/' + ip.prefix; });
+      ip: i.cidr || (i.address ? i.address + (i.netmask ? '/' + maskLen(i.netmask) : '') : ''), main: !!i.gateway,
+      up: String(i.bridge_ports || i.ovs_ports || i.slaves || i.ovs_bonds || i['vlan-raw-device'] || '').split(/[\s,]+/)[0] || '' })) };
+  });
+  const guests = await pool(vms, async vm => {
+    const cf = (await g(`/nodes/${vm.node}/${vm.type}/${vm.vmid}/config`).catch(soft(`${vm.name || vm.vmid}: Konfiguration`))) || {}, byMac = {};
+    if (vm.status === 'running') {
+      if (vm.type === 'qemu' && /^(1|enabled=1)/.test(String(cf.agent || ''))) {
+        const a = await g(`/nodes/${vm.node}/qemu/${vm.vmid}/agent/network-get-interfaces`).catch(() => null);
+        ((a && a.result) || []).forEach(i => { const ip = (i['ip-addresses'] || []).find(x => x['ip-address-type'] === 'ipv4' && !x['ip-address'].startsWith('127.')); if (ip && i['hardware-address']) byMac[i['hardware-address'].toLowerCase()] = ip['ip-address'] + '/' + ip.prefix; });
+      }
+      if (vm.type === 'lxc') { const a = await g(`/nodes/${vm.node}/lxc/${vm.vmid}/interfaces`).catch(() => null); (Array.isArray(a) ? a : []).forEach(i => { if (i.inet && i.hwaddr) byMac[i.hwaddr.toLowerCase()] = i.inet; }); }
     }
     const ifs = Object.keys(cf).filter(k => /^net\d+$/.test(k)).map(k => {
-      const o = kv(cf[k]), mac = (o.hwaddr || Object.values(o).find(x => MAC.test(x)) || '').toLowerCase();
+      const o = kv(cf[k]), mac = (o.hwaddr || Object.values(o).find(x => MAC.test(x)) || '').toLowerCase(), tr = String(o.trunks || '').split(';').filter(Boolean);
       let ip = vm.type === 'lxc' ? o.ip : kv(cf['ipconfig' + k.slice(3)]).ip;
-      if (!IPV4.test(ip || '')) ip = agent[mac] || '';
-      return { name: vm.type === 'lxc' ? (o.name || k) : k, mode: 'access', u: o.tag || '', t: [], ip, up: o.bridge || '' };
+      if (!IPV4.test(ip || '')) ip = byMac[mac] || '';
+      return { name: vm.type === 'lxc' ? (o.name || k) : k, mode: tr.length ? 'trunk' : 'access', u: o.tag || '', t: tr, ip, up: o.bridge || '' };
     });
     return { k: `pve:${vm.type}:${vm.vmid}`, name: vm.name || ('VM ' + vm.vmid), type: vm.type === 'qemu' ? 'vm' : 'lxc', host: 'pve:' + vm.node, ifs };
-  }));
-  return { cluster, hosts, guests };
+  });
+  return { cluster: (st.find(x => x.type === 'cluster') || {}).name || null, hosts, guests, stats, warnings };
 }
 async function ptr() {
   const c = cfg().ptr;
@@ -136,7 +146,7 @@ function api(q, r) {
       q.on('end', () => {
         try {
           const n = JSON.parse(b), c = cfg();
-          if (n.pve) { const o = c.pve || {}; c.pve = { url: (n.pve.url || '').replace(/\/$/, ''), tokenId: n.pve.tokenId || '', secret: n.pve.secret || o.secret || '', insecure: !!n.pve.insecure }; }
+          if (n.pve === null) delete c.pve; if (n.ptr === null) delete c.ptr; if (n.pve) { const o = c.pve || {}; c.pve = { url: (n.pve.url || '').replace(/\/$/, ''), tokenId: n.pve.tokenId || '', secret: n.pve.secret || o.secret || '', insecure: !!n.pve.insecure }; }
           if (n.ptr) { const o = c.ptr || {}; c.ptr = { url: (n.ptr.url || '').replace(/\/$/, ''), key: n.ptr.key || o.key || '', insecure: !!n.ptr.insecure }; }
           fs.mkdirSync(DATA, { recursive: true }); fs.writeFileSync(CF, JSON.stringify(c), { mode: 0o600 }); json(r, { ok: 1 });
         } catch (e) { json(r, { error: 'bad' }, 400); }
